@@ -12,14 +12,17 @@ import subprocess
 import time
 import yt_dlp
 
+is_finished = False
+
 class SilentLogger:
-    """Passes errors straight to Python without cluttering the screen."""
+    """Passes inner network exceptions straight to Python without terminal spam."""
     def debug(self, msg): pass
     def warning(self, msg): pass
     def error(self, msg):
         raise Exception(msg)
 
 def progress_hook(d):
+    global is_finished
     if d['status'] == 'downloading':
         total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
         downloaded = d.get('downloaded_bytes', 0)
@@ -36,11 +39,12 @@ def progress_hook(d):
             sys.stdout.flush()
             
     elif d['status'] == 'finished':
+        is_finished = True
         sys.stdout.write("\n[Processing] Components downloaded. Wrapping up container...\n")
         sys.stdout.flush()
 
 def rescue_file(filename, audio_only=False, force_part=True):
-    """Stitches chunks into final format. Naming depends on if the file is a part or full."""
+    """Stitches available fragments together into a marked partial or full file using ffmpeg."""
     part_file = filename + ".part"
     base_name, _ = os.path.splitext(filename)
     
@@ -55,11 +59,7 @@ def rescue_file(filename, audio_only=False, force_part=True):
         output_file = f"{base_name}.part{ext}" if force_part else f"{base_name}{ext}"
         
         print(f"\n[Finalizing] Compiling fragments to: {output_file}")
-        
-        if audio_only:
-            cmd = ['ffmpeg', '-y', '-i', part_file, '-vn', '-c:a', 'libmp3lame', '-q:a', '2', output_file]
-        else:
-            cmd = ['ffmpeg', '-y', '-i', part_file, '-c', 'copy', output_file]
+        cmd = ['ffmpeg', '-y', '-i', part_file, '-vn', '-c:a', 'libmp3lame', '-q:a', '2', output_file] if audio_only else ['ffmpeg', '-y', '-i', part_file, '-c', 'copy', output_file]
             
         try:
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -71,6 +71,7 @@ def rescue_file(filename, audio_only=False, force_part=True):
         print("\n[Notice] No working fragment data found in path to compile.")
 
 def get_opts_with_historical_offset(url, base_opts):
+    """Queries the video's stream time first to apply the user's historical timezone offset."""
     opts = base_opts.copy()
     try:
         with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
@@ -79,125 +80,170 @@ def get_opts_with_historical_offset(url, base_opts):
             
         if stream_timestamp:
             historical_struct = time.localtime(stream_timestamp)
-            if time.daylight and historical_struct.tm_isdst > 0:
-                offset_seconds = -time.altzone
-            else:
-                offset_seconds = -time.timezone
-                
+            offset_seconds = -time.altzone if (time.daylight and historical_struct.tm_isdst > 0) else -time.timezone
             sign = "+" if offset_seconds >= 0 else "-"
-            offset_str = f"{sign}{abs(offset_seconds)}"
-            
-            opts['outtmpl'] = f'%(timestamp{offset_str}>%Y-%m-%d_%H-%M-%S)s %(uploader)s - %(title)s.%(ext)s'
+            opts['outtmpl'] = f'%(timestamp{sign}{abs(offset_seconds)}>%Y-%m-%d_%H-%M-%S)s %(uploader)s - %(title)s.%(ext)s'
             return opts, meta
+    except Exception as error:
+        raise error
+
+def check_twitch_live_status(url):
+    """Quick check to verify if a Twitch channel stream is actively transmitting online."""
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+            meta = ydl.extract_info(url, download=False)
+            return meta.get('is_live', False)
     except Exception:
-        pass
-        
-    opts['outtmpl'] = '%(timestamp>%Y-%m-%d_%H-%M-%S)s %(uploader)s - %(title)s.%(ext)s'
-    return opts, None
+        return False
 
-def download_stream(url, format_selection="best", audio_only=False, interactive=True):
-    """
-    Exposed core function. Can be imported directly into other scripts/bots.
-    Set interactive=False when running inside an automated background daemon bot.
-    """
-    base_opts = {
-        'noplaylist': True,
-        'hls_use_mpegts': True, 
-        'progress_hooks': [progress_hook],
-        'logger': SilentLogger(),     
-        'no_warnings': True,
-        'nooverwrites': True,
-        'overwrites': False,
-        'retries': 0,                 
-        'fragment_retries': 0,        
-        'skip_unavailable_fragments': False,
-        'format': format_selection
+def download_interactive(url, format_selection, audio_only):
+    """Function exposed specifically for CLI terminal interactions with human users."""
+    global is_finished
+    
+    opts = {
+        'noplaylist': True, 'hls_use_mpegts': True, 'progress_hooks': [progress_hook],
+        'logger': SilentLogger(), 'no_warnings': True, 'nooverwrites': True, 'overwrites': False,
+        'retries': 0, 'fragment_retries': 0, 'skip_unavailable_fragments': False, 'format': format_selection
     }
-
     if audio_only:
-        base_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
+        opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
 
-    print(f"Target URL: {url}")
-    print("[Connecting] Fetching original broadcast details...")
-    
-    ydl_opts, metadata = get_opts_with_historical_offset(url, base_opts)
+    try:
+        ydl_opts, metadata = get_opts_with_historical_offset(url, opts)
+    except Exception as error:
+        print(f"\n[Fatal Error] Unable to parse item metadata: {error}")
+        return False
+
     filename = None
-    
+    is_true_live_stream = "twitch.tv" in url and "/videos/" not in url and "/clip/" not in url
+
     while True:
         try:
+            is_finished = False
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 if not metadata:
                     metadata = ydl.extract_info(url, download=False)
                 
                 raw_filename = ydl.prepare_filename(metadata)
-                base_name, _ = os.path.splitext(raw_filename)
-                target_ext = ".mp3" if audio_only else ".mp4"
-                filename = base_name + target_ext
+                filename = os.path.splitext(raw_filename)[0] + (".mp3" if audio_only else ".mp4")
                 
                 print(f"[File Target] Destination: {filename}")
-                
                 if os.path.exists(filename):
                     print("[System] Complete file already exists in directory. Skipping.")
                     return True
                 
                 ydl.download([url])
-                
-            # If running in an automated bot script, bypass manual prompt questions
-            if not interactive:
-                rescue_file(filename, audio_only=audio_only, force_part=True)
+            
+            if is_finished:
+                print("[Done] Download completed successfully!")
                 return True
 
-            # ROUTE 1: Stream closed natively. Prompt User.
-            try:
-                ask_complete = input("\nDownload process completed. Was the full stream recorded? [y/N]: ").strip().lower()
-            except KeyboardInterrupt:
-                ask_complete = 'n'
-                
-            if ask_complete in ['y', 'yes']:
-                rescue_file(filename, audio_only=audio_only, force_part=False)
-                print("[Done] Full stream saved successfully!")
+            if is_true_live_stream:
+                print("\n[Monitor] Live feed disconnected. Monitoring channel status for reconnection...")
+                reconnected = False
+                for attempt in range(1, 7):
+                    print(f"[Monitor] Checking status (Attempt {attempt}/6)...")
+                    if check_twitch_live_status(url):
+                        print("[Monitor] Streamer reconnected! Resuming...")
+                        reconnected = True
+                        break
+                    time.sleep(30)
+                if reconnected:
+                    metadata = None
+                    continue
+            
+            if is_true_live_stream:
+                try:
+                    ask_complete = input("\nDownload process completed. Was the full stream recorded? [y/N]: ").strip().lower()
+                except KeyboardInterrupt:
+                    ask_complete = 'n'
+                    
+                if ask_complete in ['y', 'yes']:
+                    rescue_file(filename, audio_only=audio_only, force_part=False)
+                else:
+                    rescue_file(filename, audio_only=audio_only, force_part=True)
             else:
-                rescue_file(filename, audio_only=audio_only, force_part=True)
-                print("[Done] Truncated segment saved as partial.")
+                raise Exception("Media stream collection cut short unexpectedly.")
             return True
             
         except KeyboardInterrupt:
-            # ROUTE 2: User hit Ctrl+C manually
             print("\n[Stopped] Download cancelled by user.")
-            if not interactive:
-                if filename:
-                    rescue_file(filename, audio_only=audio_only, force_part=True)
-                return False
-                
             try:
                 ask_save = input("Save what has been downloaded so far? [Y/n]: ").strip().lower()
             except KeyboardInterrupt:
                 ask_save = 'n'
-                
-            if ask_save in ['y', 'yes', '']:
-                if filename:
-                    rescue_file(filename, audio_only=audio_only, force_part=True)
+            if ask_save in ['y', 'yes', ''] and filename:
+                rescue_file(filename, audio_only=audio_only, force_part=True)
             return False
             
         except Exception as error:
-            # ROUTE 3: Initial network connection failures
-            print(f"\n[Warning] Connection failure: {error}")
-            if not interactive:
-                time.sleep(30) # Automatic bot wait
-                return False
-                
-            metadata = None 
+            print(f"\n[Warning] Connection failure during download track: {error}")
+            metadata = None
             try:
-                ask_retry = input("Network offline. Retry connection? [Y/n]: ").strip().lower()
+                ask_retry = input("Network offline or connection dropped. Retry connection? [Y/n]: ").strip().lower()
             except KeyboardInterrupt:
                 ask_retry = 'n'
-            
             if ask_retry in ['y', 'yes', '']:
-                print("[Reset] Re-attempting connection layout...")
-                time.sleep(1)
                 continue
             else:
                 return False
+
+def download_automated(url, format_selection, audio_only, max_bot_retries=10, retry_delay_seconds=30):
+    """Function exposed specifically for automated cron jobs or background daemon script loops."""
+    global is_finished
+    
+    opts = {
+        'noplaylist': True, 'hls_use_mpegts': True, 'progress_hooks': [progress_hook],
+        'logger': SilentLogger(), 'no_warnings': True, 'nooverwrites': True, 'overwrites': False,
+        'retries': 0, 'fragment_retries': 0, 'skip_unavailable_fragments': False, 'format': format_selection
+    }
+    if audio_only:
+        opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
+
+    try:
+        ydl_opts, metadata = get_opts_with_historical_offset(url, opts)
+    except Exception:
+        return False
+
+    filename = None
+    bot_attempts = 0
+    is_true_live_stream = "twitch.tv" in url and "/videos/" not in url and "/clip/" not in url
+
+    while bot_attempts < max_bot_retries:
+        try:
+            is_finished = False
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                if not metadata:
+                    metadata = ydl.extract_info(url, download=False)
+                
+                raw_filename = ydl.prepare_filename(metadata)
+                filename = os.path.splitext(raw_filename)[0] + (".mp3" if audio_only else ".mp4")
+                
+                if os.path.exists(filename):
+                    return True
+                
+                ydl.download([url])
+                
+            if is_finished:
+                return True
+
+            if is_true_live_stream and check_twitch_live_status(url):
+                metadata = None
+                continue
+            
+            force_part_flag = is_true_live_stream and not is_finished
+            if filename:
+                rescue_file(filename, audio_only=audio_only, force_part=force_part_flag)
+            return True
+            
+        except (KeyboardInterrupt, Exception):
+            bot_attempts += 1
+            metadata = None
+            time.sleep(retry_delay_seconds)
+
+    if filename:
+        rescue_file(filename, audio_only=audio_only, force_part=True)
+    return False
 
 def main():
     parser = argparse.ArgumentParser(description="CLI Downloader for YouTube and Twitch.")
@@ -211,7 +257,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Parse format flags to match library arguments
     format_selection = "bestvideo+bestaudio/best"
     if args.hd:
         format_selection = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
@@ -220,12 +265,8 @@ def main():
     elif args.audio:
         format_selection = 'bestaudio/best'
 
-    download_stream(
-        url=args.url, 
-        format_selection=format_selection, 
-        audio_only=args.audio, 
-        interactive=True
-    )
+    download_interactive(args.url, format_selection, args.audio)
 
 if __name__ == "__main__":
     main()
+
