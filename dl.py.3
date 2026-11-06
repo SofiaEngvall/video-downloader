@@ -1,0 +1,62 @@
+#!/bin/sh
+# This header finds the directory of THIS script, then runs it using its local .venv
+""":"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+exec "$SCRIPT_DIR/.venv/bin/python3" "$0" "$@"
+"""
+
+import argparse
+import yt_dlp
+
+def main():
+    parser = argparse.ArgumentParser(description="CLI Downloader for YouTube and Twitch.")
+    parser.add_argument("url", help="The YouTube or Twitch URL to download")
+    
+    quality_group = parser.add_mutually_exclusive_group()
+    quality_group.add_argument("--best", action="store_true", help="Download highest quality available")
+    quality_group.add_argument("--1080p", dest="full_hd", action="store_true", help="Cap video at 1080p")
+    quality_group.add_argument("--720p", dest="low_res", action="store_true", help="Cap video at 720p")
+    quality_group.add_argument("--audio", action="store_true", help="Extract audio only as MP3")
+
+    args = parser.parse_args()
+
+    # FIX: Native mapping format for numerical unix epoch date conversion in yt-dlp
+    output_template = '[%(timestamp>%Y-%m-%d_%H-%M-%S)s] [%(uploader)s] - %(title)s.%(ext)s'
+
+    ydl_opts = {
+        'outtmpl': output_template,
+        'noplaylist': True,
+        'hls_use_mpegts': True,
+        # Native flags to clean up terminal interaction while maintaining selectability
+        'enable_file_urls': False,
+        'windows_filenames': False,
+    }
+
+    if args.full_hd:
+        ydl_opts['format'] = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+    elif args.low_res:
+        ydl_opts['format'] = 'bestvideo[height<=720]+bestaudio/best[height<=720]'
+    elif args.audio:
+        ydl_opts['format'] = 'bestaudio/best'
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
+    else:
+        ydl_opts['format'] = 'bestvideo+bestaudio/best'
+
+    print(f"Target URL: {args.url}")
+    print("[Connecting] Querying metadata and initializing stream channel...")
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([args.url])
+        print("[Done] Process finished cleanly.")
+    except KeyboardInterrupt:
+        print("\n[Stopped] Download cancelled by user.")
+    except Exception as e:
+        print(f"\n[Error] Action failed: {e}")
+
+if __name__ == "__main__":
+    main()

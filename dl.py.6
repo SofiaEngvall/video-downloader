@@ -1,0 +1,207 @@
+#!/bin/sh
+# This header finds the directory of THIS script, then runs it using its local .venv
+""":"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+exec "$SCRIPT_DIR/.venv/bin/python3" "$0" "$@"
+"""
+
+import argparse
+import sys
+import os
+import subprocess
+import time
+import yt_dlp
+
+# =====================================================================
+# GLOBAL CONFIGURATION CONSTANTS
+# =====================================================================
+MAX_RETRIES = 5       # Number of consecutive failures before prompting
+RETRY_DELAY = 10      # Seconds to wait between network connection retries
+# =====================================================================
+
+# Global tracker to verify real download progress
+DOWNLOAD_STATUS = {"completed": False}
+
+class SilentLogger:
+    """Passes inner network exceptions up to the script silently."""
+    def debug(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg):
+        raise Exception(msg)
+
+def progress_hook(d):
+    """Custom progress display using clean single-line updates."""
+    global DOWNLOAD_STATUS
+    if d['status'] == 'downloading':
+        total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+        downloaded = d.get('downloaded_bytes', 0)
+        
+        # Track data so we can verify if the download actually finished later
+        DOWNLOAD_STATUS["downloaded"] = downloaded
+        DOWNLOAD_STATUS["total"] = total
+        
+        if total > 0:
+            percent = (downloaded / total) * 100
+            speed = d.get('speed', 0)
+            speed_mb = speed / (1024 * 1024) if speed else 0
+            
+            eta = d.get('eta')
+            if eta is not None:
+                eta = int(eta)
+                eta_str = f"{eta // 60}m {eta % 60}s"
+            else:
+                eta_str = "Unknown"
+            
+            sys.stdout.write(f"\r[Downloading] {percent:.1f}% | Speed: {speed_mb:.2f} MB/s | ETA: {eta_str}\x1b[K")
+            sys.stdout.flush()
+            
+    elif d['status'] == 'finished':
+        DOWNLOAD_STATUS["completed"] = True
+        sys.stdout.write("\n[Processing] Finalizing file components...\n")
+        sys.stdout.flush()
+
+def rescue_partial_file(filename, extract_audio=False):
+    """Safely stitches fragment data without purging tracking histories."""
+    part_file = filename + ".part"
+    
+    if not os.path.exists(part_file):
+        base, ext = os.path.splitext(filename)
+        possible_part = base + ".mp4.part"
+        if os.path.exists(possible_part):
+            part_file = possible_part
+            
+    if os.path.exists(part_file):
+        print(f"\n[Rescue] Found incomplete data: {part_file}")
+        base_path, _ = os.path.splitext(filename)
+        
+        if extract_audio:
+            final_output = base_path + ".mp3"
+            print(f"[Rescue] Finalizing partial data to Audio: {final_output}")
+            cmd = ['ffmpeg', '-y', '-i', part_file, '-vn', '-c:a', 'libmp3lame', '-q:a', '2', final_output]
+        else:
+            final_output = base_path + ".mp4"
+            print(f"[Rescue] Finalizing partial data to Video: {final_output}")
+            cmd = ['ffmpeg', '-y', '-i', part_file, '-c', 'copy', final_output]
+            
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            print("[Rescue] Success! Truncated clip saved cleanly.")
+            os.remove(part_file)
+        except Exception as e:
+            print(f"[Rescue Error] ffmpeg operation failed: {e}")
+    else:
+        print("\n[Rescue] No matching incomplete part file found to salvage.")
+
+def main():
+    global DOWNLOAD_STATUS
+    parser = argparse.ArgumentParser(description="CLI Downloader for YouTube and Twitch.")
+    parser.add_argument("url", help="The YouTube or Twitch URL to download")
+    
+    quality_group = parser.add_mutually_exclusive_group()
+    quality_group.add_argument("--best", action="store_true", help="Download highest quality available")
+    quality_group.add_argument("--1080p", dest="full_hd", action="store_true", help="Cap video at 1080p")
+    quality_group.add_argument("--720p", dest="low_res", action="store_true", help="Cap video at 720p")
+    quality_group.add_argument("--audio", action="store_true", help="Extract audio only as MP3")
+
+    args = parser.parse_args()
+
+    output_template = '[%(timestamp>%Y-%m-%d_%H-%M-%S)s] [%(uploader)s] - %(title)s.%(ext)s'
+    archive_file = os.path.expanduser('~/dl/.download_history.txt')
+
+    ydl_opts = {
+        'outtmpl': output_template,
+        'noplaylist': True,
+        'hls_use_mpegts': True, 
+        'progress_hooks': [progress_hook],
+        'logger': SilentLogger(),     
+        'no_warnings': True,
+        
+        'nooverwrites': True,
+        'overwrites': False,
+        'download_archive': archive_file, 
+        
+        'retries': 0,                 
+        'fragment_retries': 0,        
+        'skip_unavailable_fragments': False,
+    }
+
+    if args.full_hd:
+        ydl_opts['format'] = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+    elif args.low_res:
+        ydl_opts['format'] = 'bestvideo[height<=720]+bestaudio/best[height<=720]'
+    elif args.audio:
+        ydl_opts['format'] = 'bestaudio/best'
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
+    else:
+        ydl_opts['format'] = 'bestvideo+bestaudio/best'
+
+    print(f"Target URL: {args.url}")
+    
+    retry_count = 0
+    filename = None
+    
+    while True:
+        try:
+            # Reset tracking status for this attempt
+            DOWNLOAD_STATUS = {"completed": False, "downloaded": 0, "total": 0}
+            
+            print("[Connecting] Fetching original broadcast details...")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(args.url, download=False)
+                filename = ydl.prepare_filename(info)
+                
+                print(f"[File Target] Destination: {filename}")
+                ydl.download([args.url])
+                
+            # FIX: If yt-dlp returns successfully but the hook never marked it finished,
+            # it means the HLS network pipeline dropped out silently. Force an exception.
+            if not DOWNLOAD_STATUS["completed"]:
+                raise Exception("HLS stream pipe severed prematurely (Internet Disconnected).")
+                
+            print("[Done] Download completed successfully!")
+            break 
+            
+        except KeyboardInterrupt:
+            print("\n[Stopped] Download paused/cancelled by user.")
+            break
+            
+        except Exception as e:
+            retry_count += 1
+            print(f"\n[Warning] Connection dropped or network failure: {e}")
+            
+            if retry_count >= MAX_RETRIES:
+                print(f"\n[Alert] Failed {MAX_RETRIES} consecutive times.")
+                
+                try:
+                    retry_input = input("Network offline or video unavailable. Try again? [Y/n]: ").strip().lower()
+                except KeyboardInterrupt:
+                    retry_input = 'n'
+                
+                if retry_input in ['y', 'yes', '']:
+                    print(f"[Reset] Resetting failure counter. Resuming download...")
+                    retry_count = 0  
+                    time.sleep(1)
+                    continue
+                else:
+                    try:
+                        save_input = input("Abort chosen. Save the partially downloaded fragments into a file? [Y/n]: ").strip().lower()
+                    except KeyboardInterrupt:
+                        save_input = 'n'
+                        
+                    if save_input in ['y', 'yes', '']:
+                        print("[Aborting] Finalizing what was downloaded...")
+                        if filename:
+                            rescue_partial_file(filename, extract_audio=args.audio)
+                    else:
+                        print("[Aborting] Leaving temporary .part files intact for later continuation.")
+                    break
+                
+            print(f"[Retry] Attempt {retry_count}/{MAX_RETRIES}. Re-trying in {RETRY_DELAY} seconds... (Ctrl+C to abort)")
+            time.sleep(RETRY_DELAY)
+
+if __name__ == "__main__":
+    main()

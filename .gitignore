@@ -1,0 +1,5 @@
+.venv/
+*.ytdl
+*.part
+*.mp3
+*.mp4
