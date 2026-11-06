@@ -27,6 +27,16 @@ def progress_hook(d):
         total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
         downloaded = d.get('downloaded_bytes', 0)
         
+        info = d.get('info_dict', {})
+        vcodec = info.get('vcodec')
+        acodec = info.get('acodec')
+        
+        track_type = "Downloading"
+        if vcodec != 'none' and acodec == 'none':
+            track_type = "Downloading Video"
+        elif vcodec == 'none' and acodec != 'none':
+            track_type = "Downloading Audio"
+        
         if total > 0:
             percent = (downloaded / total) * 100
             speed = d.get('speed', 0)
@@ -35,12 +45,12 @@ def progress_hook(d):
             eta = d.get('eta')
             eta_str = f"{int(eta) // 60}m {int(eta) % 60}s" if eta is not None else "Unknown"
             
-            sys.stdout.write(f"\r[Downloading] {percent:.1f}% | Speed: {speed_mb:.2f} MB/s | ETA: {eta_str}\x1b[K")
+            sys.stdout.write(f"\r[{track_type}] {percent:.1f}% | Speed: {speed_mb:.2f} MB/s | ETA: {eta_str}\x1b[K")
             sys.stdout.flush()
             
     elif d['status'] == 'finished':
         is_finished = True
-        sys.stdout.write("\n[Processing] Components downloaded. Wrapping up container...\n")
+        sys.stdout.write("\n[FFmpeg] Converting components into final media container...\n")
         sys.stdout.flush()
 
 def rescue_file(filename, audio_only=False, force_part=True):
