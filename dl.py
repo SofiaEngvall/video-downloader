@@ -80,7 +80,7 @@ def rescue_file(filename, audio_only=False, force_part=True):
     else:
         print("\n[Notice] No working fragment data found in path to compile.")
 
-def get_opts_with_historical_offset(url, base_opts):
+def get_download_options(url, base_opts):
     """Queries the video's stream time first to apply the user's historical timezone offset."""
     opts = base_opts.copy()
     try:
@@ -119,7 +119,7 @@ def download_interactive(url, format_selection, audio_only):
         opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
 
     try:
-        ydl_opts, metadata = get_opts_with_historical_offset(url, opts)
+        ydl_opts, metadata = get_download_options(url, opts)
     except Exception as error:
         print(f"\n[Fatal Error] Unable to parse item metadata: {error}")
         return False
@@ -211,7 +211,7 @@ def download_automated(url, format_selection, audio_only, max_bot_retries=10, re
         opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
 
     try:
-        ydl_opts, metadata = get_opts_with_historical_offset(url, opts)
+        ydl_opts, metadata = get_download_options(url, opts)
     except Exception:
         return False
 
